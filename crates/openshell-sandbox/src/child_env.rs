@@ -80,7 +80,8 @@ mod tests {
     #[test]
     fn apply_proxy_env_includes_node_proxy_opt_in_and_local_bypass() {
         // Ensure no leftover env from other tests affects NO_PROXY
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
 
         let mut cmd = Command::new("/usr/bin/env");
         cmd.stdin(Stdio::null())
@@ -102,11 +103,13 @@ mod tests {
 
     #[test]
     fn no_proxy_includes_direct_tcp_hosts() {
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
-        std::env::set_var(
+        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
+        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_HOSTS",
             "oauth2.googleapis.com,gmail.googleapis.com",
-        );
+        ) };
 
         let no_proxy = build_no_proxy();
         assert_eq!(
@@ -115,16 +118,19 @@ mod tests {
         );
 
         // Clean up
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
     }
 
     #[test]
     fn no_proxy_includes_direct_tcp_endpoints() {
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
-        std::env::set_var(
+        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
+        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_ENDPOINTS",
             "10.0.1.215:5432, 10.0.1.215:6379 , db.internal:1025,",
-        );
+        ) };
 
         let no_proxy = build_no_proxy();
         assert_eq!(
@@ -132,7 +138,8 @@ mod tests {
             "127.0.0.1,localhost,::1,10.0.1.215,10.0.1.215,db.internal"
         );
 
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
     }
 
     #[test]
