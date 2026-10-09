@@ -7,8 +7,6 @@ use std::fmt;
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
-/// Public access to the placeholder prefix for fail-closed scanning in other modules.
-pub(crate) const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
 
 /// Marker of a provider-shaped alias: `<prefix>OPENSHELL-RESOLVE-ENV-<KEY>`.
 ///
@@ -55,8 +53,14 @@ fn alias_env_key(token: &str) -> Option<&str> {
 
 /// True if the text still carries a credential placeholder or alias marker.
 /// Used by the fail-closed scans after rewriting.
-fn contains_credential_marker(text: &str) -> bool {
+pub(crate) fn contains_credential_marker(text: &str) -> bool {
     text.contains(PLACEHOLDER_PREFIX) || text.contains(PROVIDER_ALIAS_MARKER)
+}
+
+/// True if a request line carries a placeholder or alias marker in its raw or
+/// percent-decoded form (F5 — encoded placeholder bypass).
+pub(crate) fn request_line_has_credential_marker(line: &str) -> bool {
+    contains_credential_marker(line) || contains_credential_marker(&percent_decode(line))
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +701,13 @@ pub(crate) fn rewrite_target_for_eval(
     target: &str,
     resolver: &SecretResolver,
 ) -> Result<RewriteTargetResult, UnresolvedPlaceholderError> {
+    // Provider-shaped aliases are resolved in headers only. An alias in the
+    // target would never be resolved, so fail closed before it reaches OPA or
+    // the upstream (raw and percent-decoded forms).
+    if target.contains(PROVIDER_ALIAS_MARKER) || percent_decode(target).contains(PROVIDER_ALIAS_MARKER) {
+        return Err(UnresolvedPlaceholderError { location: "path" });
+    }
+
     if !target.contains(PLACEHOLDER_PREFIX) {
         // Also check percent-decoded form
         let decoded = percent_decode(target);
@@ -1646,6 +1657,20 @@ mod tests {
         assert!(rewrite_http_header_block(raw, Some(&resolver)).is_err());
         let encoded = b"GET /x%3Ft%3Dgithub_pat_OPENSHELL%2DRESOLVE%2DENV%2DGITHUB_TOKEN HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
         assert!(rewrite_http_header_block(encoded, Some(&resolver)).is_err());
+    }
+
+    #[test]
+    fn rewrite_target_for_eval_rejects_provider_alias() {
+        // Aliases are resolved in headers only. One in the request target is
+        // never resolved, so it must fail closed instead of reaching OPA and upstream.
+        let resolver = github_resolver();
+        let err = rewrite_target_for_eval("/x?t=github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN", &resolver)
+            .expect_err("alias in target must fail closed");
+        assert_eq!(err.location, "path");
+        assert!(
+            rewrite_target_for_eval("/x?t=github_pat_OPENSHELL%2DRESOLVE%2DENV%2DGITHUB_TOKEN", &resolver)
+                .is_err()
+        );
     }
 
     #[test]
