@@ -1916,10 +1916,15 @@ fn rewrite_forward_request(
         output.extend_from_slice(&raw[header_end..used]);
     }
 
-    // Fail-closed: scan for any remaining unresolved placeholders
+    // Fail-closed: scan for any remaining unresolved placeholders or
+    // provider-shaped aliases, including the percent-decoded request line.
     if secret_resolver.is_some() {
         let output_str = String::from_utf8_lossy(&output);
-        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC) {
+        let request_line = output_str.split("\r\n").next().unwrap_or("");
+        if crate::secrets::request_line_has_credential_marker(request_line) {
+            return Err(crate::secrets::UnresolvedPlaceholderError { location: "path" });
+        }
+        if crate::secrets::contains_credential_marker(&output_str) {
             return Err(crate::secrets::UnresolvedPlaceholderError { location: "header" });
         }
     }
@@ -3168,6 +3173,59 @@ mod tests {
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    fn github_alias_resolver() -> Option<SecretResolver> {
+        SecretResolver::from_provider_env(
+            [("GITHUB_TOKEN".to_string(), "github_pat_REAL".to_string())]
+                .into_iter()
+                .collect(),
+        )
+        .1
+    }
+
+    #[test]
+    fn test_rewrite_resolves_provider_alias_auth_header() {
+        let resolver = github_alias_resolver();
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: token github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN\r\n\r\n";
+        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref())
+            .expect("should succeed");
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("Authorization: token github_pat_REAL"));
+        assert!(!result_str.contains("OPENSHELL-RESOLVE-ENV-"));
+    }
+
+    #[test]
+    fn test_rewrite_rejects_unknown_provider_alias() {
+        let resolver = github_alias_resolver();
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: token github_pat_OPENSHELL-RESOLVE-ENV-OTHER_TOKEN\r\n\r\n";
+        let err = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref())
+            .expect_err("unresolved alias must fail closed");
+        assert_eq!(err.location, "header");
+    }
+
+    #[test]
+    fn test_rewrite_rejects_provider_alias_in_path() {
+        let resolver = github_alias_resolver();
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\n\r\n";
+        assert!(
+            rewrite_forward_request(
+                raw,
+                raw.len(),
+                "/p?t=github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN",
+                resolver.as_ref(),
+            )
+            .is_err()
+        );
+        assert!(
+            rewrite_forward_request(
+                raw,
+                raw.len(),
+                "/p?t=github_pat_OPENSHELL%2DRESOLVE%2DENV%2DGITHUB_TOKEN",
+                resolver.as_ref(),
+            )
+            .is_err()
+        );
     }
 
     // --- Forward proxy SSRF defence tests ---

@@ -1152,31 +1152,40 @@ mod tests {
 
     #[test]
     fn test_parse_direct_tcp_hosts() {
-        std::env::set_var(
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_HOSTS",
             "oauth2.googleapis.com, gmail.googleapis.com , ",
-        );
+        ) };
         let hosts = parse_direct_tcp_hosts();
         assert_eq!(hosts, vec!["oauth2.googleapis.com", "gmail.googleapis.com"]);
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
     }
 
     #[test]
     fn test_parse_direct_tcp_hosts_empty() {
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
         assert!(parse_direct_tcp_hosts().is_empty());
 
-        std::env::set_var("OPENSHELL_DIRECT_TCP_HOSTS", "");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var("OPENSHELL_DIRECT_TCP_HOSTS", "") };
         assert!(parse_direct_tcp_hosts().is_empty());
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
     }
 
     #[test]
     fn test_parse_direct_tcp_endpoints_basic() {
-        std::env::set_var(
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_ENDPOINTS",
             "10.0.1.215:5432, 10.0.1.215:6379 , db.internal:1025,",
-        );
+        ) };
         let eps = parse_direct_tcp_endpoints();
         assert_eq!(
             eps,
@@ -1186,30 +1195,38 @@ mod tests {
                 DirectTcpEndpoint { host: "db.internal".into(), port: 1025 },
             ]
         );
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
     }
 
     #[test]
     fn test_parse_direct_tcp_endpoints_invalid_entries_skipped() {
-        std::env::set_var(
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_ENDPOINTS",
             "host-no-port, :5432, host:abc, good.internal:8025",
-        );
+        ) };
         let eps = parse_direct_tcp_endpoints();
         assert_eq!(
             eps,
             vec![DirectTcpEndpoint { host: "good.internal".into(), port: 8025 }]
         );
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
     }
 
     #[test]
     fn test_parse_direct_tcp_endpoints_empty() {
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
         assert!(parse_direct_tcp_endpoints().is_empty());
-        std::env::set_var("OPENSHELL_DIRECT_TCP_ENDPOINTS", "");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var("OPENSHELL_DIRECT_TCP_ENDPOINTS", "") };
         assert!(parse_direct_tcp_endpoints().is_empty());
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
     }
 
     #[test]

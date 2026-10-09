@@ -71,6 +71,18 @@ pub(crate) fn tls_env_vars(
     ]
 }
 
+/// Serializes tests that read or write `OPENSHELL_DIRECT_TCP_*`.
+///
+/// `std::env::set_var` / `remove_var` are unsafe because a concurrent read or
+/// write of the environment is undefined behavior. Tests run in parallel by
+/// default, and the tests in this module and in `sandbox::linux::netns` touch
+/// the same variables, so every such test holds this lock for its whole body.
+#[cfg(test)]
+pub(crate) fn lock_direct_tcp_env() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,8 +91,10 @@ mod tests {
 
     #[test]
     fn apply_proxy_env_includes_node_proxy_opt_in_and_local_bypass() {
+        let _env = lock_direct_tcp_env();
         // Ensure no leftover env from other tests affects NO_PROXY
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
 
         let mut cmd = Command::new("/usr/bin/env");
         cmd.stdin(Stdio::null())
@@ -102,11 +116,14 @@ mod tests {
 
     #[test]
     fn no_proxy_includes_direct_tcp_hosts() {
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
-        std::env::set_var(
+        let _env = lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_HOSTS",
             "oauth2.googleapis.com,gmail.googleapis.com",
-        );
+        ) };
 
         let no_proxy = build_no_proxy();
         assert_eq!(
@@ -115,16 +132,20 @@ mod tests {
         );
 
         // Clean up
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
     }
 
     #[test]
     fn no_proxy_includes_direct_tcp_endpoints() {
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
-        std::env::set_var(
+        let _env = lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_ENDPOINTS",
             "10.0.1.215:5432, 10.0.1.215:6379 , db.internal:1025,",
-        );
+        ) };
 
         let no_proxy = build_no_proxy();
         assert_eq!(
@@ -132,7 +153,8 @@ mod tests {
             "127.0.0.1,localhost,::1,10.0.1.215,10.0.1.215,db.internal"
         );
 
-        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
     }
 
     #[test]
