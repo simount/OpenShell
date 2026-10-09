@@ -7,13 +7,60 @@ use std::fmt;
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
-/// Public access to the placeholder prefix for fail-closed scanning in other modules.
-pub(crate) const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
+
+/// Marker of a provider-shaped alias: `<prefix>OPENSHELL-RESOLVE-ENV-<KEY>`.
+///
+/// Some clients validate the credential's shape before sending it (e.g. gh's
+/// `--attach` only accepts `github_pat_` / `ghp_` / ... tokens) and cannot carry
+/// the canonical `openshell:resolve:env:KEY` placeholder. They send an alias
+/// such as `github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN` instead, which the
+/// proxy resolves to the same secret as the canonical placeholder.
+/// Ported from NVIDIA/OpenShell#1286 (header and request-line scope only).
+const PROVIDER_ALIAS_MARKER: &str = "OPENSHELL-RESOLVE-ENV-";
 
 /// Characters that are valid in an env var key name (used to extract
 /// placeholder boundaries within concatenated strings like path segments).
 fn is_env_key_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Characters allowed in the shape prefix of a provider-shaped alias
+/// (RFC 3986 unreserved characters).
+fn is_alias_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'~')
+}
+
+/// Extract the env key from a whole-token provider-shaped alias.
+///
+/// The token must be `<prefix>OPENSHELL-RESOLVE-ENV-<KEY>` where the prefix is
+/// non-empty and made of unreserved characters, and the key runs to the end of
+/// the token. Anything else is not an alias.
+fn alias_env_key(token: &str) -> Option<&str> {
+    let marker_start = token.find(PROVIDER_ALIAS_MARKER)?;
+    if marker_start == 0 {
+        return None;
+    }
+    if !token[..marker_start].bytes().all(is_alias_token_char) {
+        return None;
+    }
+    let key_start = marker_start + PROVIDER_ALIAS_MARKER.len();
+    let key_end = token[key_start..]
+        .bytes()
+        .position(|b| !is_env_key_char(b))
+        .map_or(token.len(), |p| key_start + p);
+    (key_end == token.len() && key_end > key_start).then_some(&token[key_start..key_end])
+}
+
+/// True if the text still carries a credential placeholder or alias marker.
+/// Used by the fail-closed scans after rewriting.
+pub(crate) fn contains_credential_marker(text: &str) -> bool {
+    text.contains(PLACEHOLDER_PREFIX) || text.contains(PROVIDER_ALIAS_MARKER)
+}
+
+/// True if a request line carries a placeholder or alias marker in its raw or
+/// percent-decoded form (F5 — encoded placeholder bypass).
+pub(crate) fn request_line_has_credential_marker(line: &str) -> bool {
+    contains_credential_marker(line) || contains_credential_marker(&percent_decode(line))
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +138,15 @@ impl SecretResolver {
     /// Returns `None` if the placeholder is unknown or the resolved value
     /// contains prohibited control characters (CRLF, null byte).
     pub(crate) fn resolve_placeholder(&self, value: &str) -> Option<&str> {
-        let secret = self.by_placeholder.get(value).map(String::as_str)?;
+        let secret = match self.by_placeholder.get(value) {
+            Some(secret) => secret.as_str(),
+            None => {
+                let key = alias_env_key(value)?;
+                self.by_placeholder
+                    .get(&placeholder_for_env_key(key))
+                    .map(String::as_str)?
+            }
+        };
         match validate_resolved_secret(secret) {
             Ok(s) => Some(s),
             Err(reason) => {
@@ -610,14 +665,14 @@ pub(crate) fn rewrite_http_header_block(
     // Fail-closed scan: check for any remaining unresolved placeholders
     // in both raw form and percent-decoded form of the output header block.
     let output_header = String::from_utf8_lossy(&output[..output.len().min(header_end + 256)]);
-    if output_header.contains(PLACEHOLDER_PREFIX) {
+    if contains_credential_marker(&output_header) {
         return Err(UnresolvedPlaceholderError { location: "header" });
     }
 
     // Also check percent-decoded form of the request line (F5 — encoded placeholder bypass)
     let rewritten_rl = output_header.split("\r\n").next().unwrap_or("");
     let decoded_rl = percent_decode(rewritten_rl);
-    if decoded_rl.contains(PLACEHOLDER_PREFIX) {
+    if contains_credential_marker(&decoded_rl) {
         return Err(UnresolvedPlaceholderError { location: "path" });
     }
 
@@ -646,6 +701,13 @@ pub(crate) fn rewrite_target_for_eval(
     target: &str,
     resolver: &SecretResolver,
 ) -> Result<RewriteTargetResult, UnresolvedPlaceholderError> {
+    // Provider-shaped aliases are resolved in headers only. An alias in the
+    // target would never be resolved, so fail closed before it reaches OPA or
+    // the upstream (raw and percent-decoded forms).
+    if target.contains(PROVIDER_ALIAS_MARKER) || percent_decode(target).contains(PROVIDER_ALIAS_MARKER) {
+        return Err(UnresolvedPlaceholderError { location: "path" });
+    }
+
     if !target.contains(PLACEHOLDER_PREFIX) {
         // Also check percent-decoded form
         let decoded = percent_decode(target);
@@ -1472,5 +1534,151 @@ mod tests {
 
         assert_eq!(result.resolved, "/bottok123/method?key=key456");
         assert_eq!(result.redacted, "/bot[CREDENTIAL]/method?key=[CREDENTIAL]");
+    }
+
+    // === Provider-shaped aliases (ported from NVIDIA/OpenShell#1286) ===
+    //
+    // A client that validates the credential's shape before sending (e.g. gh's
+    // `--attach`, which only accepts `github_pat_` / `ghp_` / ... tokens) cannot
+    // carry the canonical `openshell:resolve:env:KEY` placeholder. Such a client
+    // sends `<shape-prefix>OPENSHELL-RESOLVE-ENV-KEY` instead, and the proxy must
+    // resolve it to the same secret as the canonical placeholder.
+
+    fn github_resolver() -> SecretResolver {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("GITHUB_TOKEN".to_string(), "github_pat_REAL".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        resolver.expect("resolver")
+    }
+
+    #[test]
+    fn provider_alias_resolves_to_the_canonical_secret() {
+        let resolver = github_resolver();
+        assert_eq!(
+            resolver.resolve_placeholder("github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            Some("github_pat_REAL")
+        );
+    }
+
+    #[test]
+    fn provider_alias_in_token_scheme_header_is_rewritten() {
+        let resolver = github_resolver();
+        assert_eq!(
+            rewrite_header_line(
+                "Authorization: token github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN",
+                &resolver,
+            ),
+            "Authorization: token github_pat_REAL"
+        );
+    }
+
+    #[test]
+    fn provider_alias_accepts_unreserved_prefix_characters() {
+        let resolver = github_resolver();
+        assert_eq!(
+            resolver.resolve_placeholder("a.b~c-d_e9OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            Some("github_pat_REAL")
+        );
+    }
+
+    #[test]
+    fn provider_alias_with_unknown_key_is_not_resolved() {
+        let resolver = github_resolver();
+        assert_eq!(
+            resolver.resolve_placeholder("github_pat_OPENSHELL-RESOLVE-ENV-OTHER_TOKEN"),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_alias_requires_a_non_empty_prefix() {
+        let resolver = github_resolver();
+        assert_eq!(resolver.resolve_placeholder("OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"), None);
+    }
+
+    #[test]
+    fn provider_alias_rejects_prefix_with_reserved_characters() {
+        let resolver = github_resolver();
+        assert_eq!(
+            resolver.resolve_placeholder("a/b:OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_alias_must_end_at_the_key() {
+        let resolver = github_resolver();
+        assert_eq!(
+            resolver.resolve_placeholder("github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN!x"),
+            None
+        );
+        assert_eq!(resolver.resolve_placeholder("github_pat_OPENSHELL-RESOLVE-ENV-"), None);
+    }
+
+    #[test]
+    fn provider_alias_resolution_rejects_crlf_secret() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("GITHUB_TOKEN".to_string(), "bad\r\nX-Injected: 1".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        assert_eq!(
+            resolver.resolve_placeholder("github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_alias_header_block_round_trip() {
+        let resolver = github_resolver();
+        let raw = b"POST /user-attachments/assets?name=a.webm HTTP/1.1\r\nHost: uploads.github.com\r\nAuthorization: token github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN\r\nContent-Length: 4\r\n\r\nbody";
+        let result = rewrite_http_header_block(raw, Some(&resolver)).expect("should resolve");
+        let rewritten = String::from_utf8(result.rewritten).expect("utf8");
+        assert!(rewritten.contains("Authorization: token github_pat_REAL\r\n"));
+        assert!(!rewritten.contains("OPENSHELL-RESOLVE-ENV-"));
+        assert!(rewritten.ends_with("\r\n\r\nbody"));
+    }
+
+    #[test]
+    fn unresolved_provider_alias_in_header_fails_closed() {
+        let resolver = github_resolver();
+        let raw = b"GET /user HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: token github_pat_OPENSHELL-RESOLVE-ENV-OTHER_TOKEN\r\n\r\n";
+        let err = rewrite_http_header_block(raw, Some(&resolver)).expect_err("must fail closed");
+        assert_eq!(err.location, "header");
+    }
+
+    #[test]
+    fn provider_alias_in_request_line_fails_closed() {
+        let resolver = github_resolver();
+        let raw = b"GET /x?t=github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
+        assert!(rewrite_http_header_block(raw, Some(&resolver)).is_err());
+        let encoded = b"GET /x%3Ft%3Dgithub_pat_OPENSHELL%2DRESOLVE%2DENV%2DGITHUB_TOKEN HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
+        assert!(rewrite_http_header_block(encoded, Some(&resolver)).is_err());
+    }
+
+    #[test]
+    fn rewrite_target_for_eval_rejects_provider_alias() {
+        // Aliases are resolved in headers only. One in the request target is
+        // never resolved, so it must fail closed instead of reaching OPA and upstream.
+        let resolver = github_resolver();
+        let err = rewrite_target_for_eval("/x?t=github_pat_OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN", &resolver)
+            .expect_err("alias in target must fail closed");
+        assert_eq!(err.location, "path");
+        assert!(
+            rewrite_target_for_eval("/x?t=github_pat_OPENSHELL%2DRESOLVE%2DENV%2DGITHUB_TOKEN", &resolver)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_placeholder_still_resolves_after_alias_support() {
+        let resolver = github_resolver();
+        assert_eq!(
+            rewrite_header_line("Authorization: token openshell:resolve:env:GITHUB_TOKEN", &resolver),
+            "Authorization: token github_pat_REAL"
+        );
     }
 }

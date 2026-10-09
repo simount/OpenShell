@@ -19,6 +19,128 @@ const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
 
+/// Parse the `OPENSHELL_DIRECT_TCP_HOSTS` environment variable into a list of
+/// hostnames. Returns an empty vec if the variable is unset or empty.
+fn parse_direct_tcp_hosts() -> Vec<String> {
+    let hosts = match std::env::var("OPENSHELL_DIRECT_TCP_HOSTS") {
+        Ok(val) if !val.is_empty() => val,
+        _ => return Vec::new(),
+    };
+    hosts
+        .split(',')
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+/// A single `host:port` endpoint for direct TCP bypass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectTcpEndpoint {
+    host: String,
+    port: u16,
+}
+
+/// Parse `OPENSHELL_DIRECT_TCP_ENDPOINTS` (comma-separated `host:port` pairs).
+///
+/// Each entry bypasses the egress proxy with per-endpoint iptables ACCEPT on
+/// the sandbox side and MASQUERADE + FORWARD on the host side. Use for arbitrary
+/// TCP ports beyond 443 (postgres 5432, redis 6379, smtp 1025, etc.) that the
+/// egress proxy rejects or that raw-TCP clients need.
+///
+/// `host` may be an IPv4 literal or a hostname. Hostnames are resolved at pod
+/// startup via the cluster resolver.
+fn parse_direct_tcp_endpoints() -> Vec<DirectTcpEndpoint> {
+    let raw = match std::env::var("OPENSHELL_DIRECT_TCP_ENDPOINTS") {
+        Ok(val) if !val.is_empty() => val,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((host, port)) = entry.rsplit_once(':') else {
+            warn!(entry = %entry, "OPENSHELL_DIRECT_TCP_ENDPOINTS entry missing ':port'");
+            continue;
+        };
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        let port: u16 = match port.trim().parse() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(entry = %entry, error = %e, "Invalid port in OPENSHELL_DIRECT_TCP_ENDPOINTS");
+                continue;
+            }
+        };
+        if host.is_empty() {
+            continue;
+        }
+        out.push(DirectTcpEndpoint { host: host.to_owned(), port });
+    }
+    out
+}
+
+/// Resolve a direct-TCP endpoint to one or more IPv4 addresses.
+///
+/// IPv4 literals pass through unchanged. Hostnames are resolved via the system
+/// resolver (running in the pod netns where cluster DNS works). IPv6 addresses
+/// are dropped — sandbox netns rules are IPv4-only.
+fn resolve_endpoint_ipv4s(ep: &DirectTcpEndpoint) -> Vec<std::net::Ipv4Addr> {
+    if let Ok(addr) = ep.host.parse::<std::net::Ipv4Addr>() {
+        return vec![addr];
+    }
+    match std::net::ToSocketAddrs::to_socket_addrs(&(ep.host.as_str(), ep.port)) {
+        Ok(iter) => {
+            let mut seen = Vec::new();
+            for sa in iter {
+                if let std::net::IpAddr::V4(ip) = sa.ip() {
+                    if !seen.contains(&ip) {
+                        seen.push(ip);
+                    }
+                }
+            }
+            if seen.is_empty() {
+                warn!(host = %ep.host, "No IPv4 address resolved for direct-TCP endpoint");
+            }
+            seen
+        }
+        Err(e) => {
+            warn!(host = %ep.host, error = %e, "Failed to resolve direct-TCP endpoint");
+            Vec::new()
+        }
+    }
+}
+
+/// Resolve the cluster DNS server IP for the iptables ACCEPT rule.
+///
+/// Priority:
+/// 1. `OPENSHELL_DNS_SERVER` environment variable (operator override)
+/// 2. First `nameserver` entry in `/etc/resolv.conf`
+///
+/// Returns `None` if neither source provides a valid IP, in which case
+/// no DNS ACCEPT rule will be installed and UDP DNS remains blocked.
+fn resolve_dns_server() -> Option<IpAddr> {
+    if let Ok(val) = std::env::var("OPENSHELL_DNS_SERVER") {
+        if let Ok(addr) = val.parse::<IpAddr>() {
+            return Some(addr);
+        }
+        warn!(value = %val, "OPENSHELL_DNS_SERVER is not a valid IP address, ignoring");
+    }
+
+    if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("nameserver") {
+                if let Ok(addr) = rest.trim().parse::<IpAddr>() {
+                    return Some(addr);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Handle to a network namespace with veth pair.
 ///
 /// The namespace and veth interfaces are automatically cleaned up on drop.
@@ -315,6 +437,98 @@ impl NetworkNamespace {
             }
         }
 
+        // Enable IP forwarding and NAT on the host side of the veth for DNS.
+        if let Some(dns_ip) = resolve_dns_server() {
+            let dns_ip_str = dns_ip.to_string();
+            let sandbox_ip_str = self.sandbox_ip.to_string();
+
+            let forwarding_path = format!(
+                "/proc/sys/net/ipv4/conf/{}/forwarding",
+                self.veth_host
+            );
+            if let Err(e) = std::fs::write(&forwarding_path, "1") {
+                warn!(
+                    error = %e,
+                    path = %forwarding_path,
+                    "Failed to enable IP forwarding on host veth (DNS may not work)"
+                );
+            }
+            let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+
+            let dns_cidr = format!("{dns_ip_str}/32");
+            let sandbox_cidr = format!("{sandbox_ip_str}/32");
+            let _ = Command::new(&iptables_path)
+                .args(["-t", "nat", "-A", "POSTROUTING", "-s", &sandbox_cidr, "-d", &dns_cidr, "-p", "udp", "--dport", "53", "-j", "MASQUERADE"])
+                .output();
+            let _ = Command::new(&iptables_path)
+                .args(["-A", "FORWARD", "-s", &sandbox_cidr, "-d", &dns_cidr, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+                .output();
+            let _ = Command::new(&iptables_path)
+                .args(["-A", "FORWARD", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+                .output();
+
+            info!(
+                dns_server = %dns_ip_str,
+                veth = %self.veth_host,
+                "Enabled DNS forwarding from sandbox to cluster nameserver"
+            );
+        }
+
+        // Host-side forwarding for direct TCP 443 (OPENSHELL_DIRECT_TCP_HOSTS).
+        let direct_tcp_hosts = parse_direct_tcp_hosts();
+        if !direct_tcp_hosts.is_empty() {
+            let sandbox_cidr = format!("{}/32", self.sandbox_ip);
+            let _ = Command::new(&iptables_path)
+                .args(["-t", "nat", "-A", "POSTROUTING", "-s", &sandbox_cidr, "-p", "tcp", "--dport", "443", "-j", "MASQUERADE"])
+                .output();
+            let _ = Command::new(&iptables_path)
+                .args(["-A", "FORWARD", "-s", &sandbox_cidr, "-p", "tcp", "--dport", "443", "-j", "ACCEPT"])
+                .output();
+            info!(
+                hosts = direct_tcp_hosts.len(),
+                "Enabled broad TCP 443 forwarding for OPENSHELL_DIRECT_TCP_HOSTS"
+            );
+        }
+
+        // Host-side forwarding for OPENSHELL_DIRECT_TCP_ENDPOINTS (host:port
+        // pairs). Per-endpoint MASQUERADE + FORWARD on the specific dest IP and
+        // port so the sandbox can reach services on the pod host (e.g. postgres
+        // 5432, redis 6379) without going through the egress proxy — which
+        // blocks well-known DB ports and does not handle raw TCP protocols.
+        let direct_tcp_endpoints = parse_direct_tcp_endpoints();
+        if !direct_tcp_endpoints.is_empty() {
+            let sandbox_cidr = format!("{}/32", self.sandbox_ip);
+            let mut installed = 0usize;
+            for ep in &direct_tcp_endpoints {
+                let port_str = ep.port.to_string();
+                for ip in resolve_endpoint_ipv4s(ep) {
+                    let ip_cidr = format!("{ip}/32");
+                    let _ = Command::new(&iptables_path)
+                        .args([
+                            "-t", "nat", "-A", "POSTROUTING",
+                            "-s", &sandbox_cidr, "-d", &ip_cidr,
+                            "-p", "tcp", "--dport", &port_str,
+                            "-j", "MASQUERADE",
+                        ])
+                        .output();
+                    let _ = Command::new(&iptables_path)
+                        .args([
+                            "-A", "FORWARD",
+                            "-s", &sandbox_cidr, "-d", &ip_cidr,
+                            "-p", "tcp", "--dport", &port_str,
+                            "-j", "ACCEPT",
+                        ])
+                        .output();
+                    installed += 1;
+                }
+            }
+            info!(
+                endpoints = direct_tcp_endpoints.len(),
+                rules = installed,
+                "Enabled direct TCP forwarding for OPENSHELL_DIRECT_TCP_ENDPOINTS"
+            );
+        }
+
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
                 .severity(openshell_ocsf::SeverityId::Informational)
@@ -416,6 +630,73 @@ impl NetworkNamespace {
             .build());
         }
 
+        // Rule 4.5: ACCEPT all TCP 443 when OPENSHELL_DIRECT_TCP_HOSTS is set.
+        //
+        // Some binaries (e.g. Rust/rustls programs like `gws`) cannot trust the
+        // egress proxy's TLS-terminating CA and need direct TCP 443 connections.
+        // Rather than tracking per-IP rules (which break when DNS round-robin
+        // returns new IPs), we ACCEPT all outbound TCP 443 from the sandbox.
+        //
+        // Security: applications still use HTTPS_PROXY for hosts not in NO_PROXY.
+        // This rule only affects the iptables layer — it means processes that
+        // intentionally bypass the proxy env vars can reach any HTTPS endpoint
+        // directly, which is an acceptable trade-off given the proxy cannot
+        // inspect TLS content anyway (HTTP CONNECT tunnel).
+        if !parse_direct_tcp_hosts().is_empty() {
+            if let Err(e) = run_iptables_netns(
+                &self.name,
+                iptables_cmd,
+                &["-A", "OUTPUT", "-p", "tcp", "--dport", "443", "-j", "ACCEPT"],
+            ) {
+                warn!(error = %e, "Failed to install TCP 443 ACCEPT rule");
+            } else {
+                info!("Installed broad TCP 443 ACCEPT rule for OPENSHELL_DIRECT_TCP_HOSTS");
+            }
+        }
+
+        // Rule 4.6: ACCEPT per-endpoint direct TCP for OPENSHELL_DIRECT_TCP_ENDPOINTS.
+        //
+        // Unlike DIRECT_TCP_HOSTS (broad TCP 443), endpoints are dest-IP + dport
+        // pairs — required for non-HTTPS services the proxy can't/won't handle:
+        // postgres/redis wire protocols, and ports the proxy explicitly blocks
+        // (e.g. 5432/6379 hardcoded).
+        let endpoints = parse_direct_tcp_endpoints();
+        if !endpoints.is_empty() {
+            let mut accepted = 0usize;
+            for ep in &endpoints {
+                let port_str = ep.port.to_string();
+                for ip in resolve_endpoint_ipv4s(ep) {
+                    let ip_cidr = format!("{ip}/32");
+                    if let Err(e) = run_iptables_netns(
+                        &self.name,
+                        iptables_cmd,
+                        &[
+                            "-A", "OUTPUT",
+                            "-d", &ip_cidr,
+                            "-p", "tcp", "--dport", &port_str,
+                            "-j", "ACCEPT",
+                        ],
+                    ) {
+                        warn!(
+                            error = %e,
+                            ip = %ip,
+                            port = ep.port,
+                            "Failed to install direct TCP endpoint ACCEPT rule"
+                        );
+                    } else {
+                        accepted += 1;
+                    }
+                }
+            }
+            if accepted > 0 {
+                info!(
+                    rules = accepted,
+                    endpoints = endpoints.len(),
+                    "Installed direct TCP endpoint ACCEPT rules for OPENSHELL_DIRECT_TCP_ENDPOINTS"
+                );
+            }
+        }
+
         // Rule 5: REJECT TCP bypass attempts (fast-fail)
         run_iptables_netns(
             &self.name,
@@ -431,6 +712,33 @@ impl NetworkNamespace {
                 "icmp-port-unreachable",
             ],
         )?;
+
+        // Rule 5.5: ACCEPT DNS (UDP port 53) to the cluster nameserver.
+        //
+        // Some libraries (e.g. Node.js `ws`, used by @slack/socket-mode)
+        // resolve hostnames directly via the system resolver, bypassing
+        // HTTP_PROXY / HTTPS_PROXY.  Allow UDP DNS to the nameserver
+        // configured in /etc/resolv.conf so that resolution succeeds
+        // without opening a broad UDP hole.
+        if let Some(dns_ip) = resolve_dns_server() {
+            let dns_ip_cidr = format!("{dns_ip}/32");
+            if let Err(e) = run_iptables_netns(
+                &self.name,
+                iptables_cmd,
+                &[
+                    "-A", "OUTPUT", "-d", &dns_ip_cidr, "-p", "udp", "--dport", "53", "-j",
+                    "ACCEPT",
+                ],
+            ) {
+                warn!(
+                    error = %e,
+                    dns_server = %dns_ip,
+                    "Failed to install DNS ACCEPT rule (non-fatal, UDP DNS will be rejected)"
+                );
+            } else {
+                info!(dns_server = %dns_ip, "Installed DNS ACCEPT rule for UDP port 53");
+            }
+        }
 
         // Rule 6: LOG UDP bypass attempts (rate-limited, covers DNS bypass)
         if let Err(e) = run_iptables_netns(
@@ -841,6 +1149,85 @@ mod tests {
 
     // These tests require root and network namespace support
     // Run with: sudo cargo test -- --ignored
+
+    #[test]
+    fn test_parse_direct_tcp_hosts() {
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_HOSTS",
+            "oauth2.googleapis.com, gmail.googleapis.com , ",
+        ) };
+        let hosts = parse_direct_tcp_hosts();
+        assert_eq!(hosts, vec!["oauth2.googleapis.com", "gmail.googleapis.com"]);
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
+    }
+
+    #[test]
+    fn test_parse_direct_tcp_hosts_empty() {
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
+        assert!(parse_direct_tcp_hosts().is_empty());
+
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var("OPENSHELL_DIRECT_TCP_HOSTS", "") };
+        assert!(parse_direct_tcp_hosts().is_empty());
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
+    }
+
+    #[test]
+    fn test_parse_direct_tcp_endpoints_basic() {
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_ENDPOINTS",
+            "10.0.1.215:5432, 10.0.1.215:6379 , db.internal:1025,",
+        ) };
+        let eps = parse_direct_tcp_endpoints();
+        assert_eq!(
+            eps,
+            vec![
+                DirectTcpEndpoint { host: "10.0.1.215".into(), port: 5432 },
+                DirectTcpEndpoint { host: "10.0.1.215".into(), port: 6379 },
+                DirectTcpEndpoint { host: "db.internal".into(), port: 1025 },
+            ]
+        );
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
+    }
+
+    #[test]
+    fn test_parse_direct_tcp_endpoints_invalid_entries_skipped() {
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_ENDPOINTS",
+            "host-no-port, :5432, host:abc, good.internal:8025",
+        ) };
+        let eps = parse_direct_tcp_endpoints();
+        assert_eq!(
+            eps,
+            vec![DirectTcpEndpoint { host: "good.internal".into(), port: 8025 }]
+        );
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
+    }
+
+    #[test]
+    fn test_parse_direct_tcp_endpoints_empty() {
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
+        assert!(parse_direct_tcp_endpoints().is_empty());
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::set_var("OPENSHELL_DIRECT_TCP_ENDPOINTS", "") };
+        assert!(parse_direct_tcp_endpoints().is_empty());
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
+        unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
+    }
 
     #[test]
     #[ignore = "requires root privileges"]

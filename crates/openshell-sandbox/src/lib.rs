@@ -1149,8 +1149,14 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
 ];
 
 /// Minimum read-write paths required for a proxy-mode sandbox child process:
-/// user working directory and temporary files.
-const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
+/// user working directory, temporary files, and PTY devices.
+///
+/// `/dev/ptmx` and `/dev/pts`: VS Code Remote-SSH launches its server under the
+/// sandbox policy, and the server later allocates PTYs for the integrated
+/// terminal via `node-pty`. Landlock blocks device-file opens unless they are
+/// explicitly whitelisted, so PTY allocation fails with `EACCES` unless both
+/// the PTY multiplexer and the slave PTY directory are writable.
+const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp", "/dev/ptmx", "/dev/pts"];
 
 /// GPU read-only paths.
 ///
@@ -1388,10 +1394,45 @@ mod baseline_tests {
     }
 
     #[test]
-    fn baseline_read_write_always_includes_sandbox_and_tmp() {
+    fn baseline_read_write_includes_core_runtime_and_pty_paths() {
         let (_ro, rw) = baseline_enrichment_paths();
         assert!(rw.contains(&"/sandbox".to_string()));
         assert!(rw.contains(&"/tmp".to_string()));
+        assert!(rw.contains(&"/dev/ptmx".to_string()));
+        assert!(rw.contains(&"/dev/pts".to_string()));
+    }
+
+    #[test]
+    fn enrich_proto_baseline_paths_adds_pty_paths_for_proxy_mode() {
+        let mut policy = openshell_core::proto::SandboxPolicy::default();
+        policy.network_policies.insert(
+            "test".to_string(),
+            openshell_core::proto::NetworkPolicyRule::default(),
+        );
+
+        let modified = enrich_proto_baseline_paths(&mut policy);
+        assert!(modified, "proxy-mode policy should be enriched");
+
+        let fs = policy
+            .filesystem
+            .as_ref()
+            .expect("filesystem policy should be created during enrichment");
+        assert!(
+            fs.read_write.iter().any(|p| p == "/sandbox"),
+            "proxy baseline should include /sandbox"
+        );
+        assert!(
+            fs.read_write.iter().any(|p| p == "/tmp"),
+            "proxy baseline should include /tmp"
+        );
+        assert!(
+            fs.read_write.iter().any(|p| p == "/dev/ptmx"),
+            "proxy baseline should include /dev/ptmx"
+        );
+        assert!(
+            fs.read_write.iter().any(|p| p == "/dev/pts"),
+            "proxy baseline should include /dev/pts"
+        );
     }
 
     #[test]
@@ -1404,6 +1445,15 @@ mod baseline_tests {
             !nodes.contains(&"/dev/nvidia".to_string()),
             "bare /dev/nvidia should not be enumerated: {nodes:?}"
         );
+    }
+
+    #[test]
+    fn runtime_device_paths_are_not_prepared_for_chown() {
+        assert!(is_runtime_device_path(std::path::Path::new("/dev/ptmx")));
+        assert!(is_runtime_device_path(std::path::Path::new("/dev/pts")));
+        assert!(is_runtime_device_path(std::path::Path::new("/proc")));
+        assert!(!is_runtime_device_path(std::path::Path::new("/sandbox")));
+        assert!(!is_runtime_device_path(std::path::Path::new("/tmp")));
     }
 
     #[test]
@@ -1750,10 +1800,24 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             if meta.file_type().is_symlink() {
+                if is_runtime_device_path(path) {
+                    debug!(
+                        path = %path.display(),
+                        "Skipping ownership change on runtime device symlink"
+                    );
+                    continue;
+                }
                 return Err(miette::miette!(
                     "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
                     path.display()
                 ));
+            }
+            if is_runtime_device_path(path) {
+                debug!(
+                    path = %path.display(),
+                    "Skipping ownership change on runtime device path"
+                );
+                continue;
             }
         } else {
             debug!(path = %path.display(), "Creating read_write directory");
@@ -1765,6 +1829,13 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_runtime_device_path(path: &std::path::Path) -> bool {
+    path.starts_with(std::path::Path::new("/dev"))
+        || path.starts_with(std::path::Path::new("/proc"))
+        || path.starts_with(std::path::Path::new("/sys"))
 }
 
 #[cfg(not(unix))]
