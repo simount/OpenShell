@@ -1152,33 +1152,36 @@ mod tests {
 
     #[test]
     fn test_parse_direct_tcp_hosts() {
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_HOSTS",
             "oauth2.googleapis.com, gmail.googleapis.com , ",
         ) };
         let hosts = parse_direct_tcp_hosts();
         assert_eq!(hosts, vec!["oauth2.googleapis.com", "gmail.googleapis.com"]);
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
     }
 
     #[test]
     fn test_parse_direct_tcp_hosts_empty() {
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
         assert!(parse_direct_tcp_hosts().is_empty());
 
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::set_var("OPENSHELL_DIRECT_TCP_HOSTS", "") };
         assert!(parse_direct_tcp_hosts().is_empty());
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS") };
     }
 
     #[test]
     fn test_parse_direct_tcp_endpoints_basic() {
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_ENDPOINTS",
             "10.0.1.215:5432, 10.0.1.215:6379 , db.internal:1025,",
@@ -1192,13 +1195,14 @@ mod tests {
                 DirectTcpEndpoint { host: "db.internal".into(), port: 1025 },
             ]
         );
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
     }
 
     #[test]
     fn test_parse_direct_tcp_endpoints_invalid_entries_skipped() {
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::set_var(
             "OPENSHELL_DIRECT_TCP_ENDPOINTS",
             "host-no-port, :5432, host:abc, good.internal:8025",
@@ -1208,19 +1212,20 @@ mod tests {
             eps,
             vec![DirectTcpEndpoint { host: "good.internal".into(), port: 8025 }]
         );
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
     }
 
     #[test]
     fn test_parse_direct_tcp_endpoints_empty() {
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        let _env = crate::child_env::lock_direct_tcp_env();
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
         assert!(parse_direct_tcp_endpoints().is_empty());
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::set_var("OPENSHELL_DIRECT_TCP_ENDPOINTS", "") };
         assert!(parse_direct_tcp_endpoints().is_empty());
-        // SAFETY: test-only env mutation, wrapped for edition 2024 (behavior unchanged).
+        // SAFETY: test-only; all tests touching these env vars hold lock_direct_tcp_env().
         unsafe { std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS") };
     }
 
