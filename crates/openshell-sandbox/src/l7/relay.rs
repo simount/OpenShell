@@ -7,7 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::provider::{L7Provider, RelayOutcome};
+use crate::l7::provider::{L7Provider, L7Request, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
@@ -16,7 +16,7 @@ use openshell_ocsf::{
     NetworkActivityBuilder, SeverityId, Url as OcsfUrl, ocsf_emit,
 };
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 /// Context for L7 request policy evaluation.
@@ -130,7 +130,17 @@ where
 {
     loop {
         // Parse one HTTP request from client
-        let req = match crate::l7::rest::RestProvider.parse_request(client).await {
+        let Some(parsed) = next_request_unless_upstream_closed(
+            &crate::l7::rest::RestProvider,
+            client,
+            upstream,
+            ctx,
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        let req = match parsed {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()), // Client closed connection
             Err(e) => {
@@ -288,6 +298,50 @@ where
     }
 }
 
+/// Wait for the client's next request on a keep-alive tunnel while watching
+/// the idle upstream.
+///
+/// Returns `None` when the upstream can no longer carry a request; the caller
+/// then ends the relay, which closes the client side too. An HTTP/1.1 server
+/// sends nothing between responses, so any read result on the idle upstream
+/// (EOF, an error, or unsolicited bytes such as a final `408` before closing)
+/// counts as closed. Without this, a client whose pooled connection outlives
+/// the server's keep-alive timeout writes its next request into a dead
+/// upstream and gets the connection dropped with no response (Go's
+/// `net/http` reports `EOF` and does not retry a POST). Closing the client
+/// side as soon as the upstream closes lets the client drop the connection
+/// from its pool and open a new one, as it would without the proxy.
+async fn next_request_unless_upstream_closed<P, C, U>(
+    provider: &P,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Option<Result<Option<L7Request>>>
+where
+    P: L7Provider,
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + Unpin,
+{
+    let mut probe = [0u8; 1];
+    tokio::select! {
+        parsed = provider.parse_request(client) => Some(parsed),
+        read = upstream.read(&mut probe) => {
+            let reason = match read {
+                Ok(0) => "eof".to_string(),
+                Ok(n) => format!("{n} unsolicited byte(s)"),
+                Err(e) => e.to_string(),
+            };
+            debug!(
+                host = %ctx.host,
+                port = ctx.port,
+                reason = %reason,
+                "Upstream closed idle connection, closing L7 relay"
+            );
+            None
+        }
+    }
+}
+
 /// Check if a miette error represents a benign connection close.
 ///
 /// TLS handshake EOF, missing `close_notify`, connection resets, and broken
@@ -380,7 +434,12 @@ where
 
     loop {
         // Read next request from client.
-        let req = match provider.parse_request(client).await {
+        let Some(parsed) =
+            next_request_unless_upstream_closed(&provider, client, upstream, ctx).await
+        else {
+            break;
+        };
+        let req = match parsed {
             Ok(Some(req)) => req,
             Ok(None) => break, // Client closed connection.
             Err(e) => {
