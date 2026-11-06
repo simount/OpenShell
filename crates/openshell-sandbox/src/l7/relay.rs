@@ -461,3 +461,143 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::l7::{EnforcementMode, L7Protocol, TlsMode};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+    use tokio::task::JoinHandle;
+
+    const STEP: Duration = Duration::from_secs(5);
+
+    fn test_ctx() -> L7EvalContext {
+        L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "test".into(),
+            binary_path: "/usr/bin/test".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        }
+    }
+
+    fn allow_all_engine() -> Mutex<regorus::Engine> {
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy(
+                "allow.rego".into(),
+                "package openshell.sandbox\nallow_request := true\n".into(),
+            )
+            .unwrap();
+        Mutex::new(engine)
+    }
+
+    /// Streams seen by the test: the client application side and the upstream
+    /// server side. The relay task owns the proxy-side halves, so they are
+    /// dropped (closed) as soon as the relay returns.
+    fn spawn_relay(inspect: bool) -> (DuplexStream, DuplexStream, JoinHandle<Result<()>>) {
+        let (client, mut client_proxy) = tokio::io::duplex(8192);
+        let (mut upstream_proxy, upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            let ctx = test_ctx();
+            if inspect {
+                let config = L7EndpointConfig {
+                    protocol: L7Protocol::Rest,
+                    tls: TlsMode::Auto,
+                    enforcement: EnforcementMode::Enforce,
+                };
+                relay_with_inspection(
+                    &config,
+                    allow_all_engine(),
+                    &mut client_proxy,
+                    &mut upstream_proxy,
+                    &ctx,
+                )
+                .await
+            } else {
+                relay_passthrough_with_credentials(&mut client_proxy, &mut upstream_proxy, &ctx)
+                    .await
+            }
+        });
+        (client, upstream, relay)
+    }
+
+    async fn read_until(stream: &mut DuplexStream, needle: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(needle.len()).any(|w| w == needle) {
+            let n = tokio::time::timeout(STEP, stream.read(&mut chunk))
+                .await
+                .expect("read timed out")
+                .unwrap();
+            assert_ne!(n, 0, "stream closed before the expected bytes arrived");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf
+    }
+
+    async fn round_trip(client: &mut DuplexStream, upstream: &mut DuplexStream, path: &str) {
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: api.example.com\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let req = read_until(upstream, b"\r\n\r\n").await;
+        assert!(req.starts_with(format!("GET {path} HTTP/1.1").as_bytes()));
+        upstream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let resp = read_until(client, b"\r\n\r\nok").await;
+        assert!(resp.starts_with(b"HTTP/1.1 200 OK"));
+    }
+
+    async fn assert_relay_ends_and_client_closed(
+        mut client: DuplexStream,
+        relay: JoinHandle<Result<()>>,
+    ) {
+        tokio::time::timeout(STEP, relay)
+            .await
+            .expect("relay must end once the idle upstream is gone")
+            .unwrap()
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(STEP, client.read(&mut buf))
+            .await
+            .expect("client side must be closed")
+            .unwrap();
+        assert_eq!(n, 0, "client must see EOF, not further bytes");
+    }
+
+    #[tokio::test]
+    async fn rest_relay_closes_client_when_idle_upstream_closes() {
+        let (mut client, mut upstream, relay) = spawn_relay(true);
+        round_trip(&mut client, &mut upstream, "/first").await;
+        round_trip(&mut client, &mut upstream, "/second").await;
+        drop(upstream);
+        assert_relay_ends_and_client_closed(client, relay).await;
+    }
+
+    #[tokio::test]
+    async fn passthrough_relay_closes_client_when_idle_upstream_closes() {
+        let (mut client, mut upstream, relay) = spawn_relay(false);
+        round_trip(&mut client, &mut upstream, "/first").await;
+        round_trip(&mut client, &mut upstream, "/second").await;
+        drop(upstream);
+        assert_relay_ends_and_client_closed(client, relay).await;
+    }
+
+    #[tokio::test]
+    async fn relay_closes_client_on_unsolicited_upstream_bytes() {
+        let (mut client, mut upstream, relay) = spawn_relay(true);
+        round_trip(&mut client, &mut upstream, "/first").await;
+        upstream
+            .write_all(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        assert_relay_ends_and_client_closed(client, relay).await;
+        drop(upstream);
+    }
+}
