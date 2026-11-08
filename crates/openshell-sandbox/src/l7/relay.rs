@@ -7,7 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::provider::{L7Provider, RelayOutcome};
+use crate::l7::provider::{L7Provider, L7Request, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
@@ -16,7 +16,7 @@ use openshell_ocsf::{
     NetworkActivityBuilder, SeverityId, Url as OcsfUrl, ocsf_emit,
 };
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 /// Context for L7 request policy evaluation.
@@ -130,7 +130,17 @@ where
 {
     loop {
         // Parse one HTTP request from client
-        let req = match crate::l7::rest::RestProvider.parse_request(client).await {
+        let Some(parsed) = next_request_unless_upstream_closed(
+            &crate::l7::rest::RestProvider,
+            client,
+            upstream,
+            ctx,
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        let req = match parsed {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()), // Client closed connection
             Err(e) => {
@@ -288,6 +298,50 @@ where
     }
 }
 
+/// Wait for the client's next request on a keep-alive tunnel while watching
+/// the idle upstream.
+///
+/// Returns `None` when the upstream can no longer carry a request; the caller
+/// then ends the relay, which closes the client side too. An HTTP/1.1 server
+/// sends nothing between responses, so any read result on the idle upstream
+/// (EOF, an error, or unsolicited bytes such as a final `408` before closing)
+/// counts as closed. Without this, a client whose pooled connection outlives
+/// the server's keep-alive timeout writes its next request into a dead
+/// upstream and gets the connection dropped with no response (Go's
+/// `net/http` reports `EOF` and does not retry a POST). Closing the client
+/// side as soon as the upstream closes lets the client drop the connection
+/// from its pool and open a new one, as it would without the proxy.
+async fn next_request_unless_upstream_closed<P, C, U>(
+    provider: &P,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Option<Result<Option<L7Request>>>
+where
+    P: L7Provider,
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + Unpin,
+{
+    let mut probe = [0u8; 1];
+    tokio::select! {
+        parsed = provider.parse_request(client) => Some(parsed),
+        read = upstream.read(&mut probe) => {
+            let reason = match read {
+                Ok(0) => "eof".to_string(),
+                Ok(n) => format!("{n} unsolicited byte(s)"),
+                Err(e) => e.to_string(),
+            };
+            debug!(
+                host = %ctx.host,
+                port = ctx.port,
+                reason = %reason,
+                "Upstream closed idle connection, closing L7 relay"
+            );
+            None
+        }
+    }
+}
+
 /// Check if a miette error represents a benign connection close.
 ///
 /// TLS handshake EOF, missing `close_notify`, connection resets, and broken
@@ -380,7 +434,12 @@ where
 
     loop {
         // Read next request from client.
-        let req = match provider.parse_request(client).await {
+        let Some(parsed) =
+            next_request_unless_upstream_closed(&provider, client, upstream, ctx).await
+        else {
+            break;
+        };
+        let req = match parsed {
             Ok(Some(req)) => req,
             Ok(None) => break, // Client closed connection.
             Err(e) => {
@@ -460,4 +519,144 @@ where
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::l7::{EnforcementMode, L7Protocol, TlsMode};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+    use tokio::task::JoinHandle;
+
+    const STEP: Duration = Duration::from_secs(5);
+
+    fn test_ctx() -> L7EvalContext {
+        L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "test".into(),
+            binary_path: "/usr/bin/test".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        }
+    }
+
+    fn allow_all_engine() -> Mutex<regorus::Engine> {
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy(
+                "allow.rego".into(),
+                "package openshell.sandbox\nallow_request := true\n".into(),
+            )
+            .unwrap();
+        Mutex::new(engine)
+    }
+
+    /// Streams seen by the test: the client application side and the upstream
+    /// server side. The relay task owns the proxy-side halves, so they are
+    /// dropped (closed) as soon as the relay returns.
+    fn spawn_relay(inspect: bool) -> (DuplexStream, DuplexStream, JoinHandle<Result<()>>) {
+        let (client, mut client_proxy) = tokio::io::duplex(8192);
+        let (mut upstream_proxy, upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            let ctx = test_ctx();
+            if inspect {
+                let config = L7EndpointConfig {
+                    protocol: L7Protocol::Rest,
+                    tls: TlsMode::Auto,
+                    enforcement: EnforcementMode::Enforce,
+                };
+                relay_with_inspection(
+                    &config,
+                    allow_all_engine(),
+                    &mut client_proxy,
+                    &mut upstream_proxy,
+                    &ctx,
+                )
+                .await
+            } else {
+                relay_passthrough_with_credentials(&mut client_proxy, &mut upstream_proxy, &ctx)
+                    .await
+            }
+        });
+        (client, upstream, relay)
+    }
+
+    async fn read_until(stream: &mut DuplexStream, needle: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(needle.len()).any(|w| w == needle) {
+            let n = tokio::time::timeout(STEP, stream.read(&mut chunk))
+                .await
+                .expect("read timed out")
+                .unwrap();
+            assert_ne!(n, 0, "stream closed before the expected bytes arrived");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf
+    }
+
+    async fn round_trip(client: &mut DuplexStream, upstream: &mut DuplexStream, path: &str) {
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: api.example.com\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let req = read_until(upstream, b"\r\n\r\n").await;
+        assert!(req.starts_with(format!("GET {path} HTTP/1.1").as_bytes()));
+        upstream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let resp = read_until(client, b"\r\n\r\nok").await;
+        assert!(resp.starts_with(b"HTTP/1.1 200 OK"));
+    }
+
+    async fn assert_relay_ends_and_client_closed(
+        mut client: DuplexStream,
+        relay: JoinHandle<Result<()>>,
+    ) {
+        tokio::time::timeout(STEP, relay)
+            .await
+            .expect("relay must end once the idle upstream is gone")
+            .unwrap()
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(STEP, client.read(&mut buf))
+            .await
+            .expect("client side must be closed")
+            .unwrap();
+        assert_eq!(n, 0, "client must see EOF, not further bytes");
+    }
+
+    #[tokio::test]
+    async fn rest_relay_closes_client_when_idle_upstream_closes() {
+        let (mut client, mut upstream, relay) = spawn_relay(true);
+        round_trip(&mut client, &mut upstream, "/first").await;
+        round_trip(&mut client, &mut upstream, "/second").await;
+        drop(upstream);
+        assert_relay_ends_and_client_closed(client, relay).await;
+    }
+
+    #[tokio::test]
+    async fn passthrough_relay_closes_client_when_idle_upstream_closes() {
+        let (mut client, mut upstream, relay) = spawn_relay(false);
+        round_trip(&mut client, &mut upstream, "/first").await;
+        round_trip(&mut client, &mut upstream, "/second").await;
+        drop(upstream);
+        assert_relay_ends_and_client_closed(client, relay).await;
+    }
+
+    #[tokio::test]
+    async fn relay_closes_client_on_unsolicited_upstream_bytes() {
+        let (mut client, mut upstream, relay) = spawn_relay(true);
+        round_trip(&mut client, &mut upstream, "/first").await;
+        upstream
+            .write_all(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        assert_relay_ends_and_client_closed(client, relay).await;
+        drop(upstream);
+    }
 }
